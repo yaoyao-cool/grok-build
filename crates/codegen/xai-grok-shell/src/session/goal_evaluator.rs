@@ -76,10 +76,26 @@ pub(crate) enum GoalEvaluatorParseError {
     UnexpectedBlockerKey,
 }
 
+/// Host-side verdict contract (the same mechanism workflow agents use via
+/// `schema_contract`): the schema never reaches the wire, so evaluator rounds work on
+/// backends and models without native `json_schema` support.
+static VERDICT_CONTRACT: std::sync::LazyLock<jsonschema::Validator> =
+    std::sync::LazyLock::new(|| {
+        crate::session::workflow::schema_contract::compile_contract_schema(
+            &goal_evaluator_json_schema(),
+        )
+        .expect("built-in goal evaluator schema must compile")
+    });
+
 pub(crate) fn parse_goal_evaluator_verdict(
     raw: &str,
 ) -> Result<GoalEvaluatorVerdict, GoalEvaluatorParseError> {
-    serde_json::from_str::<GoalEvaluatorVerdict>(raw.trim())
+    let value = crate::session::workflow::schema_contract::validate_contract_output(
+        &VERDICT_CONTRACT,
+        raw,
+    )
+    .map_err(GoalEvaluatorParseError::InvalidJson)?;
+    serde_json::from_value::<GoalEvaluatorVerdict>(value)
         .map_err(|error| GoalEvaluatorParseError::InvalidJson(error.to_string()))?
         .validate()
 }
@@ -168,9 +184,18 @@ pub(crate) fn build_goal_evaluator_request(
         "transcript": transcript,
         "plan": plan.unwrap_or("(no plan available)"),
     });
+    // Like workflow agents' <output-contract>: the schema rides in the prompt and the
+    // verdict is validated host-side, so no wire `json_schema` is sent and models
+    // without structured-output support still work.
+    let schema = serde_json::to_string_pretty(&goal_evaluator_json_schema())
+        .unwrap_or_else(|_| "\"object\"".to_string());
+    let system_prompt = format!(
+        "{SYSTEM_PROMPT}\n\nThe response must match this JSON schema exactly:\n{schema}\n\n\
+         Respond with ONLY the JSON object as raw text."
+    );
     ConversationRequest {
         items: vec![
-            ConversationItem::system(SYSTEM_PROMPT),
+            ConversationItem::system(system_prompt),
             ConversationItem::user(input.to_string()),
         ],
         tools: vec![],
@@ -180,7 +205,7 @@ pub(crate) fn build_goal_evaluator_request(
         temperature: None,
         max_output_tokens: None,
         reasoning_effort: None,
-        json_schema: Some(goal_evaluator_json_schema()),
+        json_schema: None,
         x_grok_conv_id: Some(session_id.to_owned()),
         x_grok_req_id: Some(format!("xai-goal-eval-{}", uuid::Uuid::new_v4())),
         x_grok_session_id: Some(session_id.to_owned()),
@@ -261,11 +286,45 @@ mod tests {
     }
 
     #[test]
-    fn request_is_tool_free_and_schema_constrained() {
+    fn request_is_tool_free_and_prompt_contracted() {
         let request = build_goal_evaluator_request("goal", "trace", None, "small".into(), "s");
         assert!(request.tools.is_empty());
         assert!(request.hosted_tools.is_empty());
-        assert!(request.json_schema.is_some());
+        // Contract rides in the prompt, never on the wire.
+        assert!(request.json_schema.is_none());
+        let system = request
+            .items
+            .first()
+            .map(ConversationItem::text_content)
+            .unwrap_or_default();
+        assert!(system.contains("candidate_complete"));
+        assert!(system.contains("ONLY the JSON object"));
         assert_eq!(request.model.as_deref(), Some("small"));
+    }
+
+    #[test]
+    fn parse_tolerates_fences_and_surrounding_prose() {
+        let verdict = r#"{"decision":"continue","evidence":"e","next_step":"n","blocker_key":""}"#;
+        for raw in [
+            verdict.to_string(),
+            format!("```json\n{verdict}\n```"),
+            format!("Here is my verdict:\n\n{verdict}\n\nThanks."),
+        ] {
+            assert!(
+                parse_goal_evaluator_verdict(&raw).is_ok(),
+                "rejected wrapped verdict: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_still_rejects_garbage_and_semantic_violations() {
+        for raw in [
+            "no json here at all",
+            "```json\n{\"unrelated\": true}\n```",
+            r#"{"decision":"blocked","evidence":"x","next_step":"y","blocker_key":""}"#,
+        ] {
+            assert!(parse_goal_evaluator_verdict(raw).is_err(), "accepted {raw}");
+        }
     }
 }
